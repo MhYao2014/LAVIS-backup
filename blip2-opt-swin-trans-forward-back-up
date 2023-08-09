@@ -1,0 +1,242 @@
+# 任务1：cross-attention + 随机query tokens + query tokens用Qformer来完成OCR
+image_tmp = samples["image"]
+image = self.visual_encoder.prepare_input(Image.open(samples["image_path"][0]), random_padding=False)
+image = image.reshape(image_tmp.shape).to(image_tmp.device)
+image_embeds = self.ln_vision(self.visual_encoder(image))
+image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
+img_patch_num = image_embeds.shape[1] # 测一下img_patch的数量
+
+num_vis_que = self.query_tokens.shape[1] // 2 # self.query_tokens.shape[1]  # 用作抓取视觉特征的总query_token数量
+query_tokens = self.query_tokens[:,:num_vis_que,:].expand(image_embeds.shape[0], -1, -1)  # 用作抓取视觉特征的总query_token
+query_pos = self.Qformer.bert.embeddings.position_embeddings(torch.tensor([i for i in range(query_tokens.shape[1])]).to(image.device)).expand(image_embeds.shape[0], -1, -1)
+
+# 对qformer_translated求两个梯度 maxmize P(Q_q1,Q_q2,...Q_qn) 与maxmize P(Q_1, Q_2, ..., Q_n)
+approx_qformer_targets = [self.opt_tokenizer(p).input_ids[:query_tokens[b,:,:].shape[0]] for b, p in enumerate(samples["paragraph"])]
+approx_qformer_targets = [targets if len(targets)==query_tokens[b,:,:].shape[0] 
+                          else targets + [1]*(query_tokens[b,:,:].shape[0] - len(targets)) 
+                          for b, targets in enumerate(approx_qformer_targets)]
+query_token_attention_mask = [[1 if ids!= 1 else 0 for ids in targets] for targets in approx_qformer_targets]
+approx_qformer_targets = torch.tensor(approx_qformer_targets).to(image.device)
+query_token_attention_mask = torch.tensor(query_token_attention_mask).to(image.device)
+position_ids = torch.tensor([i for i in range(query_tokens.shape[1])]).to(image.device)
+with self.maybe_autocast():
+    outputs = self.Qformer(
+        attention_mask=query_token_attention_mask,
+        query_embeds=query_tokens+query_pos,
+        encoder_hidden_states=image_embeds,
+        encoder_attention_mask=image_atts,
+        labels = approx_qformer_targets,
+        is_decoder=True,
+        return_dict=True,
+    )
+loss_bert = outputs.loss 
+loss_bert.backward()
+loss_bert_float = loss_bert.item()
+
+# 任务2：cross-attention + 随机query tokens + query tokens用OPT完成OCR
+# 计算qformer_translated全部可见的情况下，ocr的loss：P(E_1,E_2,...,E_l|Q_1, Q_2, ..., Q_n)
+image_tmp = samples["image"]
+image = self.visual_encoder.prepare_input(Image.open(samples["image_path"][0]), random_padding=False)
+image = image.reshape(image_tmp.shape).to(image_tmp.device)
+image_embeds = self.ln_vision(self.visual_encoder(image))
+image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(# 这里可见度设为了0，希望起到作用
+    image.device
+)
+img_patch_num = image_embeds.shape[1] # 测一下img_patch的数量
+
+query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)  # 用作抓取视觉特征的总query_token
+query_output = self.Qformer.bert(
+    query_embeds=query_tokens,
+    encoder_hidden_states=image_embeds,
+    encoder_attention_mask=image_atts,
+    return_dict=True,
+)
+qformer_translated = self.opt_proj(query_output.last_hidden_state)
+atts_opt = torch.ones(qformer_translated.size()[:-1], dtype=torch.long).to(image.device)
+atts_opt[:, :num_vis_que] = 0
+self.opt_tokenizer.padding_side = "right"
+text = [p + " " + "<s>" for p in samples["paragraph"]] # 拿出所有的文本
+opt_tokens = self.opt_tokenizer(
+    text,
+    return_tensors="pt",
+    padding="longest",
+    truncation=True,
+    max_length=self.max_txt_len,
+).to(image.device)
+ocr_targets = opt_tokens.input_ids.masked_fill(
+    opt_tokens.input_ids == self.opt_tokenizer.pad_token_id, -100
+)
+null_qformer_targets = (
+    torch.ones(atts_opt.size(), dtype=torch.long).to(image.device).fill_(-100)
+)
+# assert null_qformer_targets.shape == approx_qformer_targets.shape
+targets = torch.cat([null_qformer_targets, ocr_targets], dim=1)
+# targets = torch.cat([approx_qformer_targets, ocr_targets], dim=1)
+text_embeds = self.opt_model.model.decoder.embed_tokens(opt_tokens.input_ids)
+inputs_embeds = torch.cat([qformer_translated, text_embeds], dim=1)
+attention_mask = torch.cat([atts_opt, opt_tokens.attention_mask], dim=1)
+with self.maybe_autocast():
+    outputs = self.opt_model(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        return_dict=True,
+        labels=targets,
+    )
+loss_ocr = outputs.loss 
+loss_ocr_float = loss_ocr.item()
+loss.backward() 
+
+# 任务3：
+###实体边界与repeat任务######实体边界与repeat任务######实体边界与repeat任务######实体边界与repeat任务######实体边界与repeat任务######实体边界与repeat任务######实体边界与repeat任务######实体边界与repeat任务######实体边界与repeat任务######实体边界与repeat任务######实体边界与repeat任务######实体边界与repeat任务###
+#         image_tmp = samples["image"]
+#         image = self.visual_encoder.prepare_input(Image.open(samples["image_path"][0]), random_padding=False)
+#         image = image.reshape(image_tmp.shape).to(image_tmp.device)
+#         image_embeds = self.ln_vision(self.visual_encoder(image))
+# #         with self.maybe_autocast():
+# #             image_embeds = self.ln_vision(self.visual_encoder(image))
+# #             image_embeds = image_embeds + self.visual_encoder.pos_embed
+#         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(# 这里可见度设为了0，希望起到作用
+#             image.device
+#         )
+#         num_text_que = self.query_tokens.shape[1] // 2 # query_token中间三分之一用作抓取重复特征 
+#         query_tokens = self.query_tokens[:,num_vis_que:,:].expand(image_embeds.shape[0], -1, -1)  # query_token后一半用作抓取重复特征 
+    
+#         query_output = self.Qformer.bert(
+#             query_embeds=query_tokens,
+#             encoder_hidden_states=image_embeds,
+#             encoder_attention_mask=image_atts,
+#             return_dict=True,
+#         )
+        
+#         inputs_opt = self.opt_proj(query_output.last_hidden_state)
+#         atts_opt = torch.ones(inputs_opt.size()[:-1], dtype=torch.long).to(image.device)
+
+#         self.opt_tokenizer.padding_side = "right"
+#         # 实体边界与repeat任务需要1、同步分割nestedPara，samples["answer"]; 2、随机取连续的一部分，并替换answer中的label；3、标注好相应的掩码,使得随机label不产生loss便于后续拼接target
+#         new_nestedPara = []
+#         for nestedPara in samples['nestedPara']:
+#             sep_entity = [entity.strip('{') for entity in nestedPara.split('} ') if entity != '']
+#             new_nestedPara.append(sep_entity)
+#         new_answer = []
+#         for answer in samples['answer']:
+#             sep_ent_an = [ent_an.strip('{').split('|') for ent_an in answer.split('} ') if ent_an != '']
+#             new_answer.append(sep_ent_an)
+        
+#         label_set = list(set([a for e, a in new_answer[0]]))
+#         text = []
+#         mau_targets = [] # 目前只考虑了bz = 1的情况
+#         for new_nest, new_ans in zip(new_nestedPara, new_answer):
+#             ratio = random.randint(1,len(new_nest))  # ratio有几率=len(new_nest)
+#             # random_entity_ids = sorted(random.sample(range(0, len(new_nest)), ratio)) #0-len(new_nest)表示从【0，。，len(new_nest)-1】中抽取，ratio最大等于len(new_nest)
+#             part_nest = new_nest[0:ratio] #  [new_nest[entity_id] for entity_id in random_entity_ids] 
+#             part_ans = new_ans[0:ratio] #  [new_ans[entity_id] for entity_id in random_entity_ids] 
+#             part_ans = [[e, random.choice(label_set)] for e, a in part_ans] # 故意扰乱标签，让重复功能与标签无关，而只和OCR原文有关
+#             # 这条注释解释了下面几行中{前的空格是用来约束其变为Ġ{：self.opt_tokenizer.convert_ids_to_tokens(self.opt_tokenizer(" {").input_ids) = "Ġ{"
+#             tmp_text = " " + '} '.join(["{"+nest for nest in part_nest])+"}" + '</s>' + " " + '} '.join(["{"+ent+"|"+ans for ent, ans in part_ans])+"}" + ' <s>'
+#             tmp_target = self.opt_tokenizer(" " + '} '.join(["{"+nest for nest in part_nest])+"}" + '</s>').input_ids # len()*[-100] # 所有的OCR原文都不要复述，不该变成target
+#             for ent, ans in part_ans:
+#                 tmp_target += self.opt_tokenizer(" " + "{"+ent+"|").input_ids[1:] + len(self.opt_tokenizer(ans+"}").input_ids[1:])*[-100]  # rand label和}也不成为target
+#             tmp_target += self.opt_tokenizer(" " + "<s>").input_ids[1:]  # 最重要的终止符的target也要带上。
+#             mau_targets.append(tmp_target)
+#             text.append(tmp_text)
+
+#         opt_tokens = self.opt_tokenizer(text, return_tensors='pt', padding='longest', truncation=True, max_length=self.max_txt_len).to(image.device)
+#         targets = opt_tokens.input_ids.masked_fill(opt_tokens.input_ids == self.opt_tokenizer.pad_token_id, -100)  # 让padding不成为target
+        
+#         assert len(mau_targets[0]) == len(targets.tolist()[0]), print('手动计算target出了问题')
+#         targets = torch.tensor(mau_targets).to(self.device)
+#         inputs_embeds = self.opt_model.model.decoder.embed_tokens(opt_tokens.input_ids)
+#         # 在这个任务中，text做了分割，也要对相应的Qformer-translated做分割
+#         qformer_translated_num = int(num_text_que * (ratio/len(new_nestedPara[0])))
+#         empty_targets = ( # 这是repeat query的空目标
+#             torch.ones(atts_opt.size(), dtype=torch.long).to(image.device).fill_(-100)
+#         )
+#         targets = torch.cat([empty_targets[:,:qformer_translated_num], targets], dim=1)
+#         inputs_embeds = torch.cat([inputs_opt[:,:qformer_translated_num,:], inputs_embeds], dim=1)
+#         attention_mask = torch.cat([atts_opt[:,:qformer_translated_num], opt_tokens.attention_mask], dim=1)
+
+#         with self.maybe_autocast():
+#             outputs = self.opt_model(
+#                 inputs_embeds=inputs_embeds,
+#                 attention_mask=attention_mask,
+#                 return_dict=True,
+#                 labels=targets,
+#             )
+            
+#         loss_repeat = outputs.loss
+# #         loss_repeat.backward() # 第二次反向传播，累积实体边界和复述的梯度，但不更新
+#         loss_repeat_float = loss_repeat.item()
+# #         ###标签预测任务######标签预测任务######标签预测任务######标签预测任务######标签预测任务######标签预测任务######标签预测任务######标签预测任务######标签预测任务######标签预测任务######标签预测任务######标签预测任务######标签预测任务######标签预测任务######标签预测任务######标签预测任务######标签预测任务######标签预测任务###
+#         image_tmp = samples["image"]
+#         image = self.visual_encoder.prepare_input(Image.open(samples["image_path"][0]), random_padding=False)
+#         image = image.reshape(image_tmp.shape).to(image_tmp.device)
+#         image_embeds = self.ln_vision(self.visual_encoder(image))
+# #         with self.maybe_autocast():
+# #             image_embeds = self.ln_vision(self.visual_encoder(image))
+# #             image_embeds = image_embeds + self.visual_encoder.pos_embed
+#         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
+#             image.device
+#         )
+        
+#         query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)  # 标签预测任务vis query, repeat query, prompt, ocr原文全都要用 
+#         query_output = self.Qformer.bert(
+#             query_embeds=query_tokens,
+#             encoder_hidden_states=image_embeds,
+#             encoder_attention_mask=image_atts,
+#             return_dict=True,
+#         )
+#         inputs_opt = self.opt_proj(query_output.last_hidden_state)     # self.opt_proj(concat_last_hidden_state)
+#         atts_opt = torch.ones(inputs_opt.size()[:-1], dtype=torch.long).to(image.device)
+
+#         self.opt_tokenizer.padding_side = "right"
+#         # 标签预测任务需要1、同步分割nestedPara，samples["answer"]; 2、标注好相应的掩码,使得只有label产生loss便于后续拼接target
+        
+#         new_nestedPara = []
+#         for nestedPara in samples['nestedPara']:
+#             sep_entity = [entity.strip('{') for entity in nestedPara.split('} ') if entity != '']
+#             new_nestedPara.append(sep_entity)
+#         new_answer = []
+#         for answer in samples['answer']:
+#             sep_ent_an = [ent_an.strip('{').split('|') for ent_an in answer.split('} ') if ent_an != '']
+#             new_answer.append(sep_ent_an)
+        
+#         text = []
+#         mau_targets = [] # 目前只考虑了bz = 1的情况
+#         for new_nest, new_ans in zip(new_nestedPara, new_answer):
+#             # 这条注释解释了下面几行中{前的空格是用来约束其变为Ġ{：self.opt_tokenizer.convert_ids_to_tokens(self.opt_tokenizer(" " + "{").input_ids) = "Ġ{"
+#             tmp_text = self.prompt + '</s>' + " " + '} '.join(["{"+nest for nest in new_nest])+"}" + '</s>' + " " + '} '.join(["{"+ent+"|"+ans for ent, ans in new_ans])+"}"
+#             tmp_target = len(self.opt_tokenizer(self.prompt + '</s>' + " " + '} '.join(["{"+nest for nest in new_nest])+"}" + '</s>').input_ids) * [-100]
+#             for ent, ans in new_ans:
+#                 tmp_target += len(self.opt_tokenizer(" " + "{"+ent+"|").input_ids[1:])*[-100] + self.opt_tokenizer(ans+"}").input_ids[1:]  # 让label和}也不成为target
+#             mau_targets.append(tmp_target)
+#             text.append(tmp_text)
+
+#         opt_tokens = self.opt_tokenizer(text, return_tensors='pt', padding='longest', truncation=True, max_length=self.max_txt_len).to(image.device)
+#         targets = opt_tokens.input_ids.masked_fill(opt_tokens.input_ids == self.opt_tokenizer.pad_token_id, -100)  # 让padding不成为target
+# #         pdb.set_trace()
+#         assert len(mau_targets[0]) == len(targets.tolist()[0]), print('手动计算target出了问题')
+#         targets = torch.tensor(mau_targets).to(self.device)
+
+#         empty_targets = ( # 这是repeat query的空目标
+#             torch.ones(atts_opt.size(), dtype=torch.long).to(image.device).fill_(-100)
+#         )
+#         targets = torch.cat([empty_targets, targets], dim=1)
+
+#         inputs_embeds = self.opt_model.model.decoder.embed_tokens(opt_tokens.input_ids)
+#         inputs_embeds = torch.cat([inputs_opt, inputs_embeds], dim=1)
+#         attention_mask = torch.cat([atts_opt, opt_tokens.attention_mask], dim=1)
+
+#         with self.maybe_autocast():
+#             outputs = self.opt_model(
+#                 inputs_embeds=inputs_embeds,
+#                 attention_mask=attention_mask,
+#                 return_dict=True,
+#                 labels=targets,
+#             )
+            
+#         loss_opt = outputs.loss
+#         loss_opt_float = loss_opt.item()
+#         return {"loss_opt": loss_opt_float, "loss_bert": 0, "loss_ocr":loss_ocr_float, \
+#                 "loss_repeat":loss_repeat_float, \
+#                 "loss":loss_opt+loss_ocr+loss_repeat}
+#         return {"loss_opt": loss_opt_float, "loss_bert": loss_bert_float, "loss":loss_opt+2*loss_bert}
